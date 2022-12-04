@@ -25,11 +25,13 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Analysis/Trace.h"
 
 /* *******Implementation Starts Here******* */
 // include necessary header files
@@ -44,6 +46,126 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "fplicm"
+
+// Recursively finds all subloops in a loop
+std::vector<Loop*> GetAllSubLoops(Loop* L) {
+  std::vector<Loop*> allLoops;
+  for (Loop *SL : L->getSubLoops()) {
+    std::vector<Loop*> subLoops = GetAllSubLoops(SL);
+    allLoops.insert(allLoops.end(), subLoops.begin(), subLoops.end());
+  }
+  allLoops.push_back(L);
+  return allLoops;
+}
+
+// Find all loops given a loop info
+std::vector<Loop*> FindAllLoops(LoopInfo &LI) {
+  std::vector<Loop*> loops;
+  for (Loop* L : LI) {
+    std::vector<Loop*> containedLoops = GetAllSubLoops(L);
+    loops.insert(loops.end(), containedLoops.begin(), containedLoops.end());
+  }
+  return loops;
+}
+
+namespace BaseTrace {
+  struct BaseTracePass : public ModulePass {
+    static char ID;
+    BaseTracePass() : ModulePass(ID) {};
+    BaseTracePass(char id): ModulePass(id) {};
+
+    Trace GrowTrace(BasicBlock* seedBB, DominatorTree &DT) {
+      std::vector<BasicBlock*> trace;
+      trace.push_back(seedBB);
+      BasicBlock *currBB = seedBB;
+      while (1) {
+        visited.insert(currBB);
+        BasicBlock *likelyBB = predict(currBB);
+        if (!likelyBB || visited.find(likelyBB) != visited.end()) {break;}
+        if (DT.dominates(&likelyBB->front(), &currBB->front())) {break;}
+        currBB = likelyBB;
+      }
+      return Trace(trace);
+    }
+
+    bool runOnModule(Module &M) override {
+
+      prepare(M);
+
+      for (Function &F : M) {
+        LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>(F).getLoopInfo();
+        DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
+
+        std::vector<Loop*> allLoops = FindAllLoops(LI);
+        // TODO: sort the loops based on depth
+
+        // create block list based on loop
+        for (Loop* L : allLoops) {
+          errs() << "\nLoop\n";
+          for (BasicBlock* BB : L->getBlocksVector()) {
+            if (visited.find(BB) != visited.end() && !inSubLoop(BB, L, &LI)) {
+              traces.push_back(GrowTrace(BB, DT));
+            }
+            errs() << BB->getName() << '\n';
+          }
+        }
+
+        errs() << "\nFunc\n";
+        for (BasicBlock &BB : F) {
+          if (visited.find(&BB) != visited.end()) {
+            traces.push_back(GrowTrace(&BB, DT));
+          }
+          errs() << BB.getName() << '\n';
+        }
+      }
+
+      // evaluation
+      
+      return false;
+    }
+    
+    virtual void prepare(Module &M) {
+
+    }
+
+    virtual BasicBlock* predict(BasicBlock *BB) {
+      return nullptr;
+    }
+
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequired<BranchProbabilityInfoWrapperPass>();
+      AU.addRequired<BlockFrequencyInfoWrapperPass>();
+      AU.addRequired<LoopInfoWrapperPass>();
+      AU.addRequired<DominatorTreeWrapperPass>();
+    }
+    private:
+    std::set<BasicBlock*> visited;
+    std::vector<Trace> traces;
+    /// Little predicate that returns true if the specified basic block is in
+    /// a subloop of the current one, not the current one itself.
+    bool inSubLoop(BasicBlock *BB, Loop *CurLoop, LoopInfo *LI) {
+      assert(CurLoop->contains(BB) && "Only valid if BB is IN the loop");
+      return LI->getLoopFor(BB) != CurLoop;
+    }
+  };
+}
+
+char BaseTrace::BaseTracePass::ID = 0;
+static RegisterPass<BaseTrace::BaseTracePass>
+    B("base",
+      "testing inheritence", false, false);
+
+namespace Child {
+  struct ChildPass : public BaseTrace::BaseTracePass {
+    static char ID;
+    ChildPass() : BaseTracePass(ID) {};
+
+  };
+}
+char Child::ChildPass::ID = 0;
+static RegisterPass<Child::ChildPass>
+    C("child",
+      "testing inheritence", false, false);
 
 /* A helper class that uses K as key and vector<V> as value */
 template <class K, class V> class KeyValues {
