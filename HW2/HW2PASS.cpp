@@ -32,6 +32,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Analysis/Trace.h"
+#include "llvm/Analysis/PostDominators.h"
 
 /* *******Implementation Starts Here******* */
 // include necessary header files
@@ -44,6 +45,7 @@
 /* *******Implementation Ends Here******* */
 
 using namespace llvm;
+using namespace std;
 
 #define DEBUG_TYPE "fplicm"
 
@@ -69,18 +71,18 @@ std::vector<Loop*> FindAllLoops(LoopInfo &LI) {
 }
 
 namespace BaseTrace {
-  struct BaseTracePass : public ModulePass {
+  struct BaseTracePass : public FunctionPass {
     static char ID;
-    BaseTracePass() : ModulePass(ID) {};
-    BaseTracePass(char id): ModulePass(id) {};
+    BaseTracePass() : FunctionPass(ID) {};
+    BaseTracePass(char id): FunctionPass(id) {};
 
-    Trace GrowTrace(BasicBlock* seedBB, DominatorTree &DT) {
+    Trace GrowTrace(BasicBlock* seedBB, DominatorTree &DT, PostDominatorTree &PDT, Function &F) {
       std::vector<BasicBlock*> trace;
       trace.push_back(seedBB);
       BasicBlock *currBB = seedBB;
       while (1) {
         visited.insert(currBB);
-        BasicBlock *likelyBB = predict(currBB);
+        BasicBlock *likelyBB = predict(currBB, F, PDT);
         if (!likelyBB || visited.find(likelyBB) != visited.end()) {break;}
         if (DT.dominates(&likelyBB->front(), &currBB->front())) {break;}
         currBB = likelyBB;
@@ -88,35 +90,33 @@ namespace BaseTrace {
       return Trace(trace);
     }
 
-    bool runOnModule(Module &M) override {
+    bool runOnFunction(Function &F) override {
+      LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+      DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+      PostDominatorTree &PDT = getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
 
-      prepare(M);
+      prepare(F, LI, PDT);
 
-      for (Function &F : M) {
-        LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>(F).getLoopInfo();
-        DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
+      std::vector<Loop*> allLoops = FindAllLoops(LI);
+      // TODO: sort the loops based on depth
 
-        std::vector<Loop*> allLoops = FindAllLoops(LI);
-        // TODO: sort the loops based on depth
-
-        // create block list based on loop
-        for (Loop* L : allLoops) {
-          errs() << "\nLoop\n";
-          for (BasicBlock* BB : L->getBlocksVector()) {
-            if (visited.find(BB) != visited.end() && !inSubLoop(BB, L, &LI)) {
-              traces.push_back(GrowTrace(BB, DT));
-            }
-            errs() << BB->getName() << '\n';
+      // create block list based on loop
+      for (Loop* L : allLoops) {
+        errs() << "\nLoop\n";
+        for (BasicBlock* BB : L->getBlocksVector()) {
+          if (visited.find(BB) != visited.end() && !inSubLoop(BB, L, &LI)) {
+            traces.push_back(GrowTrace(BB, DT, PDT, F));
           }
+          errs() << BB->getName() << '\n';
         }
+      }
 
-        errs() << "\nFunc\n";
-        for (BasicBlock &BB : F) {
-          if (visited.find(&BB) != visited.end()) {
-            traces.push_back(GrowTrace(&BB, DT));
-          }
-          errs() << BB.getName() << '\n';
+      errs() << "\nFunc\n";
+      for (BasicBlock &BB : F) {
+        if (visited.find(&BB) != visited.end()) {
+          traces.push_back(GrowTrace(&BB, DT, PDT, F));
         }
+        errs() << BB.getName() << '\n';
       }
 
       // evaluation
@@ -124,11 +124,11 @@ namespace BaseTrace {
       return false;
     }
     
-    virtual void prepare(Module &M) {
+    virtual void prepare(Function &F, LoopInfo &LI, PostDominatorTree &PDT) {
 
     }
 
-    virtual BasicBlock* predict(BasicBlock *BB) {
+    virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT) {
       return nullptr;
     }
 
@@ -137,6 +137,7 @@ namespace BaseTrace {
       AU.addRequired<BlockFrequencyInfoWrapperPass>();
       AU.addRequired<LoopInfoWrapperPass>();
       AU.addRequired<DominatorTreeWrapperPass>();
+      AU.addRequired<PostDominatorTreeWrapperPass>();
     }
     private:
     std::set<BasicBlock*> visited;
@@ -155,345 +156,300 @@ static RegisterPass<BaseTrace::BaseTracePass>
     B("base",
       "testing inheritence", false, false);
 
-namespace Child {
-  struct ChildPass : public BaseTrace::BaseTracePass {
+namespace StaticTrace {
+  struct StaticTracePass : public BaseTrace::BaseTracePass {
     static char ID;
-    ChildPass() : BaseTracePass(ID) {};
+    StaticTracePass() : BaseTracePass(ID) {};
 
+    bool containHazard(BasicBlock* bb) {
+      for (BasicBlock::iterator i = bb->begin(), e = bb->end(); i != e; ++i) {
+          std::string op = i->getOpcodeName();
+          if (op=="call") // subroutine call
+              return true;
+          if (i->isAtomic()) // sync instr
+              return true;
+          if (op=="store") { // ambiguous store
+              Value *oper = i->getOperand(1); // get the store destination
+              if (auto *constant = dyn_cast<Constant>(oper)) continue;
+              else return true;
+          }
+          if (op=="ret") // subroutine return
+              return true;
+          if (op=="indirectbr") // indirect jump
+              return true;
+      }
+      return false;
+  }
+
+    virtual void prepare(Function &F, LoopInfo &LI, PostDominatorTree &PDT) override {
+      for (Function::iterator bb = F.begin(), e = F.end(); bb != e; ++bb) {
+          for (BasicBlock::iterator i = bb->begin(), e = bb->end(); i != e; ++i) {
+              if (BranchInst *Ibr = dyn_cast<BranchInst>(&(*i))) { // branch instr
+                  if (Ibr->isConditional()) { // conditional branch
+                      Value *cond = Ibr->getCondition();
+                      Instruction *Icond = dyn_cast<Instruction>(cond);
+                      Value *op0 = Icond->getOperand(0);
+                      Value *op1 = Icond->getOperand(1);
+                      pair<Value*, Value*> brOps = make_pair(op0, op1);
+                      pair<int, bool> brPred;
+                      auto res = brdirMap.find(brOps);
+                      if (ICmpInst *ICC = dyn_cast<ICmpInst>(Icond)) {
+                          if (op0->getType()->isPointerTy()) {
+                          // the two operands must be the same type, enough to check one
+                              if (ICC->getPredicate()==CmpInst::ICMP_EQ) { // beq
+                                  brPred = make_pair(1, true); // label2 is likely
+                                  brdirMap[brOps] = brPred;
+                              }
+                              if (ICC->getPredicate()==CmpInst::ICMP_NE) { // bne
+                                  brPred = make_pair(1, false); // label1 is likely
+                                  brdirMap[brOps] = brPred;
+                              }
+                          }
+                          if (Constant *const0 = dyn_cast<Constant>(op0)) {
+                              if (const0->isZeroValue()) {
+                                  if (ICC->getPredicate()==CmpInst::ICMP_SGT | 
+                                      ICC->getPredicate()==CmpInst::ICMP_UGT) { // greater than
+                                      brPred = make_pair(3, true); // label2 is likely
+                                      res = brdirMap.find(brOps);
+                                      if (res != brdirMap.end()) {
+                                          if ((res->second).first<3) {}
+                                          else brdirMap[brOps] = brPred;
+                                      }
+                                      else brdirMap[brOps] = brPred;
+                                  }
+                                  if (ICC->getPredicate()==CmpInst::ICMP_SLE |
+                                      ICC->getPredicate()==CmpInst::ICMP_ULE) { // less or equal
+                                      brPred = make_pair(3, false); // label1 is likely
+                                      res = brdirMap.find(brOps);
+                                      if (res != brdirMap.end()) {
+                                          if ((res->second).first<3) {}
+                                          else brdirMap[brOps] = brPred;
+                                      }
+                                      else brdirMap[brOps] = brPred;
+                                  }
+                              }
+                          }
+                          if (Constant *const1 = dyn_cast<Constant>(op1)) {
+                              if (const1->isZeroValue()) {
+                                  if (ICC->getPredicate()==CmpInst::ICMP_SLT |
+                                      ICC->getPredicate()==CmpInst::ICMP_ULT) { // less than
+                                      brPred = make_pair(3, true); // label2 is likely
+                                      res = brdirMap.find(brOps);
+                                      if (res != brdirMap.end()) {
+                                          if ((res->second).first<3) {}
+                                          else brdirMap[brOps] = brPred;
+                                      }
+                                      else brdirMap[brOps] = brPred;
+                                  }
+                                  if (ICC->getPredicate()==CmpInst::ICMP_SGE |
+                                      ICC->getPredicate()==CmpInst::ICMP_UGE) { // greater or equal
+                                      brPred = make_pair(3, false); // label1 is likely
+                                      res = brdirMap.find(brOps);
+                                      if (res != brdirMap.end()) {
+                                          if ((res->second).first<3) {}
+                                          else brdirMap[brOps] = brPred;
+                                      }
+                                      else brdirMap[brOps] = brPred;
+                                  }
+                              }
+                          }
+                      }
+                      if (FCmpInst *FCC = dyn_cast<FCmpInst>(Icond)) {
+                          if (FCC->getPredicate()==CmpInst::FCMP_OEQ |
+                              FCC->getPredicate()==CmpInst::FCMP_UEQ) { // beq
+                              brPred = make_pair(3, true); // label2 is likely
+                              res = brdirMap.find(brOps);
+                              if (res != brdirMap.end()) {
+                                  if ((res->second).first<3) {}
+                                  else brdirMap[brOps] = brPred;
+                              }
+                              else brdirMap[brOps] = brPred;
+                          }
+                          if (FCC->getPredicate()==CmpInst::FCMP_ONE |
+                              FCC->getPredicate()==CmpInst::FCMP_UNE) { // bne
+                              brPred = make_pair(3, false); // label1 is likely
+                              res = brdirMap.find(brOps);
+                              if (res != brdirMap.end()) {
+                                  if ((res->second).first<3) {}
+                                  else brdirMap[brOps] = brPred;
+                              }
+                              else brdirMap[brOps] = brPred;
+                          }
+                          if (Constant *const0 = dyn_cast<Constant>(op0)) {
+                              if (const0->isZeroValue()) {
+                                  if (FCC->getPredicate()==CmpInst::FCMP_OGT |
+                                      FCC->getPredicate()==CmpInst::FCMP_UGT) { // greater than
+                                      brPred = make_pair(3, true); // label2 is likely
+                                      res = brdirMap.find(brOps);
+                                      if (res != brdirMap.end()) {
+                                          if ((res->second).first<3) {}
+                                          else brdirMap[brOps] = brPred;
+                                      }
+                                      else brdirMap[brOps] = brPred;
+                                  }
+                                  if (FCC->getPredicate()==CmpInst::FCMP_OLE |
+                                      FCC->getPredicate()==CmpInst::FCMP_ULE) { // less or equal
+                                      brPred = make_pair(3, false); // label1 is likely
+                                      res = brdirMap.find(brOps);
+                                      if (res != brdirMap.end()) {
+                                          if ((res->second).first<3) {}
+                                          else brdirMap[brOps] = brPred;
+                                      }
+                                      else brdirMap[brOps] = brPred;
+                                  }
+                              }
+                          }
+                          if (Constant *const1 = dyn_cast<Constant>(op1)) {
+                              if (const1->isZeroValue()) {
+                                  if (FCC->getPredicate()==CmpInst::FCMP_OLT |
+                                      FCC->getPredicate()==CmpInst::FCMP_ULT) { // less than
+                                      brPred = make_pair(3, true); // label2 is likely
+                                      res = brdirMap.find(brOps);
+                                      if (res != brdirMap.end()) {
+                                          if ((res->second).first<3) {}
+                                          else brdirMap[brOps] = brPred;
+                                      }
+                                      else brdirMap[brOps] = brPred;
+                                  }
+                                  if (FCC->getPredicate()==CmpInst::FCMP_OGE |
+                                      FCC->getPredicate()==CmpInst::FCMP_UGE) { // greater or equal
+                                      brPred = make_pair(3, false); // label1 is likely
+                                      res = brdirMap.find(brOps);
+                                      if (res != brdirMap.end()) {
+                                          if ((res->second).first<3) {}
+                                          else brdirMap[brOps] = brPred;
+                                      }
+                                      else brdirMap[brOps] = brPred;
+                                  }
+                              }
+                          }
+                      }
+                      
+                      bool inloop[2] = {0, 0}; // for branch direction heuristic
+                      bool inloopPrehead[2] = {0, 0}; // for loop heuristic
+                      for (unsigned bridx = 0; bridx < 2; bridx++) {
+                          BasicBlock *Succ = Ibr->getSuccessor(bridx);
+                          for (Loop* L : LI) {
+                              BasicBlock *preHead = L->getLoopPreheader();
+                              if (preHead==Succ) inloopPrehead[bridx] = 1;
+                              vector<BasicBlock *> allBlocks = L->getBlocks();
+                              if (find(allBlocks.begin(), allBlocks.end(), Succ) != allBlocks.end())
+                                  inloop[bridx] = 1;
+                          }
+                      }
+                      res = brdirMap.find(brOps);
+                      if (inloopPrehead[0] & !inloopPrehead[1]) {
+                          brPred = make_pair(2, false); // label1 is likely
+                          if (res != brdirMap.end()) {
+                              if ((res->second).first<2) {}
+                              else brdirMap[brOps] = brPred;
+                          }
+                          else brdirMap[brOps] = brPred;
+                      }
+                      if (!inloopPrehead[0] & inloopPrehead[1]) {
+                          brPred = make_pair(2, true); // label2 is likely
+                          if (res != brdirMap.end()) {
+                              if ((res->second).first<2) {}
+                              else brdirMap[brOps] = brPred;
+                          }
+                          else brdirMap[brOps] = brPred;
+                      }
+                      res = brdirMap.find(brOps);
+                      if (inloop[0] & !inloop[1]) {
+                          brPred = make_pair(5, false); // label1 is likely
+                          if (res != brdirMap.end()) {
+                              if ((res->second).first<5) {}
+                              else brdirMap[brOps] = brPred;
+                          }
+                          else brdirMap[brOps] = brPred;
+                      }
+                      if (!inloop[0] & inloop[1]) {
+                          brPred = make_pair(5, true); // label2 is likely
+                          if (res != brdirMap.end()) {
+                              if ((res->second).first<5) {}
+                              else brdirMap[brOps] = brPred;
+                          }
+                          else brdirMap[brOps] = brPred;
+                      }
+                      
+                      bool leadtouse[2] = {0, 0}; // for guard heuristic
+                      for (unsigned bridx = 0; bridx < 2; bridx++) {
+                          for (Function::iterator bIt = F.begin(), END = F.end(); bIt != END; ++bIt) {
+                              if (PDT.dominates(&bIt->front(), &Ibr->getSuccessor(bridx)->front())) {
+                                  for (User *op0User : op0->users()) {
+                                      if (Instruction *Iop0User = dyn_cast<Instruction>(op0User)) {
+                                          BasicBlock *Iop0UserBlock = Iop0User->getParent();
+                                          if (&(*bIt)==Iop0UserBlock) leadtouse[bridx] = 1;
+                                      }
+                                  }
+                                  for (User *op1User : op1->users()) {
+                                      if (Instruction *Iop1User = dyn_cast<Instruction>(op1User)) {
+                                          BasicBlock *Iop1UserBlock = Iop1User->getParent();
+                                          if (&(*bIt)==Iop1UserBlock) leadtouse[bridx] = 1;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      res = brdirMap.find(brOps);
+                      if (leadtouse[0] & !leadtouse[1]) {
+                          brPred = make_pair(4, false); // label1 is likely
+                          if (res != brdirMap.end()) {
+                              if ((res->second).first<4) {}
+                              else brdirMap[brOps] = brPred;
+                          }
+                          else brdirMap[brOps] = brPred;
+                      }
+                      if (!leadtouse[0] & leadtouse[1]) {
+                          brPred = make_pair(4, true); // label2 is likely
+                          if (res != brdirMap.end()) {
+                              if ((res->second).first<4) {}
+                              else brdirMap[brOps] = brPred;
+                          }
+                          else brdirMap[brOps] = brPred;
+                      }
+                  }
+              }
+          }
+      }
+    }
+
+    virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT) override {
+      if (containHazard(BB)) return nullptr;
+      Instruction *T = BB->getTerminator();
+      if (BranchInst *brInst = dyn_cast<BranchInst>(T)) {
+          if (brInst->isConditional()) { // conditional branch
+              Instruction *Icond = dyn_cast<Instruction>(brInst->getCondition());
+              pair<Value*, Value*> brOps = make_pair(Icond->getOperand(0), Icond->getOperand(1));
+              bool hasHazard[2] = {0, 0};
+              for (unsigned bridx = 0; bridx < 2; bridx++) {
+                  BasicBlock *Succ = brInst->getSuccessor(bridx);
+                  if (containHazard(Succ)) hasHazard[bridx] = 1;
+                  for (Function::iterator bb = F.begin(), e = F.end(); bb != e; ++bb) {
+                      if (PDT.dominates(&bb->front(), &Succ->front()))
+                          if (containHazard(&(*bb))) hasHazard[bridx] = 1;
+                  }
+              }
+              if (hasHazard[0] & !hasHazard[1]) return brInst->getSuccessor(1);
+              if (!hasHazard[0] & hasHazard[1]) return brInst->getSuccessor(0);
+              if (hasHazard[0] & hasHazard[1]) return nullptr;
+              
+              auto res = brdirMap.find(brOps);
+              if (res != brdirMap.end()) {
+                  if ((res->second).second) return brInst->getSuccessor(1);
+                  else return brInst->getSuccessor(0);
+              }
+          }
+      }
+      return T->getSuccessor(0); // if no applicable heuristic, return the first succ
+    }
+
+    private:
+    // <op0, op1>: <heuristic priority (1:highest), branch to label1(false)/label2(true)>
+    map<pair<Value*, Value*>, pair<int, bool> > brdirMap;
   };
 }
-char Child::ChildPass::ID = 0;
-static RegisterPass<Child::ChildPass>
-    C("child",
+char StaticTrace::StaticTracePass::ID = 0;
+static RegisterPass<StaticTrace::StaticTracePass>
+    C("static",
       "testing inheritence", false, false);
-
-/* A helper class that uses K as key and vector<V> as value */
-template <class K, class V> class KeyValues {
-public:
-  typedef typename std::vector<V> Values;
-
-  void addItem(K key, V dep) {
-    if (_keyValues.find(key) == _keyValues.end())
-      _keyValues[key] = Values();
-    _keyValues[key].push_back(dep);
-  }
-
-  void removeItem(K key, V dep) {
-    _keyValues[key].erase(std::remove(_keyValues[key].begin(), _keyValues[key].end(), dep), _keyValues[key].end());
-    if (_keyValues[key].size() == 0)
-      removeKey(key);
-  }
-
-  void removeKey(K key) { _keyValues.erase(key); }
-
-  typename std::map<K, Values>::iterator begin() { return _keyValues.begin(); }
-  typename std::map<K, Values>::iterator end() { return _keyValues.end(); }
-  Values &operator[](K key) { return _keyValues[key]; }
-
-private:
-  typename std::map<K, Values> _keyValues;
-};
-
-namespace Correctness {
-struct FPLICMPass : public LoopPass {
-  static char ID;
-  FPLICMPass() : LoopPass(ID) {}
-
-  bool runOnLoop(Loop *L, LPPassManager &LPM) override {
-    bool Changed = false;
-
-    /* *******Implementation Starts Here******* */
-
-    BranchProbabilityInfo &BPI =
-        getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
-
-    BasicBlock *preheader = L->getLoopPreheader();
-    BasicBlock *header = L->getHeader();
-
-    std::set<BasicBlock *> frequentPath({header});
-    BasicBlock *bb = header;
-    while (1) { // assumption: there will always be a frequent path
-      BasicBlock *next_bb = nullptr;
-      for (auto succ : successors(&*bb)) {
-        // errs() << bb->getName() << ' ' << succ->getName() << ' ' <<
-        // BPI.getEdgeProbability(&*bb, succ) << '\n';
-        if (BPI.getEdgeProbability(&*bb, succ) >= BranchProbability(8, 10)) {
-          frequentPath.insert(succ);
-          next_bb = succ;
-        }
-      }
-      bb = next_bb;
-      if (bb == header)
-        break;
-    }
-
-    std::vector<BasicBlock *> allBlocks = L->getBlocks();
-    std::set<BasicBlock *> infrequentPath;
-    std::set_difference(allBlocks.begin(), allBlocks.end(),
-                        frequentPath.begin(), frequentPath.end(),
-                        std::inserter(infrequentPath, infrequentPath.end()));
-
-    // find frequent loads and corresponding infrequent deps
-    KeyValues<Instruction *, Instruction *> hoistDeps;
-    for (auto freqBlock : frequentPath) {
-      for (auto inst = freqBlock->begin(); inst != freqBlock->end(); inst++)
-        if (inst->getOpcode() == Instruction::Load)
-          for (auto U : inst->getOperand(0)->users()) // U is of type User*
-            if (auto I = dyn_cast<Instruction>(U))
-              if (I->getOpcode() == Instruction::Store) { 
-                if (frequentPath.find(I->getParent()) != frequentPath.end()) {
-                  hoistDeps.removeKey(cast<Instruction>(inst));
-                  break;
-                }
-                if (infrequentPath.find(I->getParent()) !=
-                    infrequentPath.end()) {
-                  hoistDeps.addItem(cast<Instruction>(inst), I);
-                }
-              }
-    }
-
-    // find unique load targets
-    KeyValues<Value *, Instruction *> regLoadMap;
-    for (auto const &depsPair : hoistDeps) {
-      Instruction *loadInst = depsPair.first;
-      Value *loadTarget = loadInst->getOperand(0);
-      regLoadMap.addItem(loadTarget, loadInst);
-    }
-
-    // hoist loads
-    for (auto const &regLoadPair : regLoadMap) {
-      Changed = true;
-      Value *loadTarget = regLoadPair.first;
-      std::vector<Instruction *> loadInsts = regLoadPair.second;
-
-      for (auto const &loadInst : loadInsts) {
-        if (loadInst ==
-            loadInsts[0]) { // only hoist once for each unique target
-          AllocaInst *var =
-              new AllocaInst(loadInst->getType(), 0, nullptr,
-                             dyn_cast<LoadInst>(loadInst)->getAlign(), "",
-                             preheader->getTerminator());
-          LoadInst *hoistLoadInst = new LoadInst(
-              loadInst->getType(), loadTarget, "", preheader->getTerminator());
-          StoreInst *st =
-              new StoreInst(hoistLoadInst, var, preheader->getTerminator());
-          loadTarget->replaceUsesOutsideBlock(var, preheader);
-        }
-        for (auto const &depInst : hoistDeps[loadInst]) { // add fix-up code
-          // Do nothing if only hoist load
-        }
-      }
-    }
-
-    /* *******Implementation Ends Here******* */
-
-    return Changed;
-  }
-
-  void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.addRequired<BranchProbabilityInfoWrapperPass>();
-    AU.addRequired<BlockFrequencyInfoWrapperPass>();
-    AU.addRequired<LoopInfoWrapperPass>();
-  }
-
-private:
-  /// Little predicate that returns true if the specified basic block is in
-  /// a subloop of the current one, not the current one itself.
-  bool inSubLoop(BasicBlock *BB, Loop *CurLoop, LoopInfo *LI) {
-    assert(CurLoop->contains(BB) && "Only valid if BB is IN the loop");
-    return LI->getLoopFor(BB) != CurLoop;
-  }
-};
-} // end of namespace Correctness
-
-char Correctness::FPLICMPass::ID = 0;
-static RegisterPass<Correctness::FPLICMPass>
-    X("fplicm-correctness",
-      "Frequent Loop Invariant Code Motion for correctness test", false, false);
-
-namespace Performance {
-struct FPLICMPass : public LoopPass {
-  static char ID;
-  FPLICMPass() : LoopPass(ID) {}
-
-  bool runOnLoop(Loop *L, LPPassManager &LPM) override {
-    bool Changed = false;
-
-    /* *******Implementation Starts Here******* */
-
-    BranchProbabilityInfo &BPI =
-        getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
-    LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-
-    // only optimize the inner-most loop
-    for (auto const& block : L->getBlocks())
-      if (inSubLoop(block, L, &LI)) return Changed;
-
-    BasicBlock *preheader = L->getLoopPreheader();
-    BasicBlock *header = L->getHeader();
-
-    std::set<BasicBlock *> frequentPath({header});
-    BasicBlock *bb = header;
-    while (1) { // assumption: there will always be a frequent path
-      BasicBlock *next_bb = nullptr;
-      for (auto succ : successors(&*bb)) {
-        if (BPI.getEdgeProbability(&*bb, succ) >= BranchProbability(8, 10)) {
-          frequentPath.insert(succ);
-          next_bb = succ;
-        }
-      }
-      bb = next_bb;
-      if (bb == header) break;
-    }
-
-    std::vector<BasicBlock *> allBlocks = L->getBlocks();
-    std::set<BasicBlock *> infrequentPath;
-    std::set_difference(allBlocks.begin(), allBlocks.end(),
-                        frequentPath.begin(), frequentPath.end(),
-                        std::inserter(infrequentPath, infrequentPath.end()));
-
-    // find frequent loads and corresponding infrequent deps
-    KeyValues<Instruction *, Instruction *> hoistDeps;
-    for (auto freqBlock : frequentPath) {
-      for (auto inst = freqBlock->begin(); inst != freqBlock->end(); inst++)
-        if (inst->getOpcode() == Instruction::Load)
-          for (auto U : inst->getOperand(0)->users()) // U is of type User*
-            if (auto I = dyn_cast<Instruction>(U))
-              if (I->getOpcode() == Instruction::Store) { 
-                if (frequentPath.find(I->getParent()) != frequentPath.end()) {
-                  hoistDeps.removeKey(cast<Instruction>(inst));
-                  break;
-                }
-                if (infrequentPath.find(I->getParent()) !=
-                    infrequentPath.end()) {
-                  hoistDeps.addItem(cast<Instruction>(inst), I);
-                }
-              }
-    }
-
-    // Find load chain (instructions following load)
-    KeyValues<Instruction*, Instruction*> loadChains;
-    for (auto const &depsPair : hoistDeps) {
-      Instruction *loadInst = depsPair.first;
-      std::set<Value*> almostInvariants = {loadInst->getOperand(0), loadInst};
-      
-      // initialize queue
-      std::deque<Instruction*> consumers_q;
-      for (auto U : loadInst->users())
-          if (auto I = dyn_cast<Instruction>(U))
-            consumers_q.push_back(I);
-
-      while (consumers_q.size() > 0) {
-        Instruction *consumerInst = consumers_q[0];
-        consumers_q.pop_front();
-
-        if (frequentPath.find(consumerInst->getParent()) == frequentPath.end()) continue;
-        if (consumerInst->getOpcode() == Instruction::Store) continue;
-
-        bool isInvariantInst = true;
-        for (auto it=consumerInst->op_begin(); it!=consumerInst->op_end(); it++) {
-          Value *operand = cast<Value>(it);
-          if (!L->isLoopInvariant(operand) && almostInvariants.find(operand) == almostInvariants.end()) {
-            isInvariantInst = false;
-            break;
-          }
-        }
-        if (!isInvariantInst) continue;
-
-        loadChains.addItem(loadInst, consumerInst);
-        almostInvariants.insert(consumerInst);
-
-        for (auto U : consumerInst->users())
-          if (auto I = dyn_cast<Instruction>(U))
-            consumers_q.push_back(I);
-      }
-    }
-
-    for (auto const& loadChainPair : loadChains) {
-      Instruction* loadInst = loadChainPair.first;
-      std::vector<Instruction*> loadChain = loadChainPair.second;
-      errs() << "Load chain for " << *loadChainPair.first << '\n';
-      for (auto inst : loadChain)
-        errs() << *inst << '\n';
-      errs() << '\n';
-    }
-
-    // hoist 
-    for (auto const &hoistDepPair : hoistDeps) {
-      // errs() << *preheader << '\n';
-      Changed = true;
-      Instruction* loadInst = hoistDepPair.first;
-      std::vector<Instruction*> loadChain = loadChains[loadInst];
-      
-      AllocaInst *var = new AllocaInst(loadChain.back()->getType(), 0, nullptr, cast<LoadInst>(loadInst)->getAlign(), "", preheader->getTerminator());
-      StoreInst *st = new StoreInst(loadChain.back(), var, preheader->getTerminator());
-      // create a new load that loads var
-      LoadInst *replaceLoad = new LoadInst(
-              loadChain.back()->getType(), var, "", loadChain.back()->getNextNode());
-      
-      // errs() << *preheader << '\n' << "Load block: " << *replaceLoad->getParent() << '\n';
-
-      loadInst->moveBefore(var);  // move load to preheader (before var)
-      // move the load chain to preheader (before var)
-      for (auto const &inst : loadChain) {
-        inst->moveBefore(var);
-      }
-      
-      loadChain.back()->replaceUsesOutsideBlock(replaceLoad, preheader);
-
-      // errs() << "After change: \n";
-      // errs() << *preheader << '\n' << "Load block: " << *replaceLoad->getParent() << '\n';
-
-      for (auto const &depInst : hoistDeps[loadInst]) { // add fix-up code
-        // errs() << "\nStore block: " << *depInst->getParent() << '\n';
-        ValueToValueMapTy vmap;
-        for (auto const &inst : loadChain) {
-          Instruction* newInst = inst->clone();
-
-          // remap the load instructions
-          for (auto it=newInst->op_begin(); it!=newInst->op_end(); it++) {
-            if (*it == loadInst){
-              // errs() << "match\n change to " << *depInst->getOperand(0) << '\n';
-              *it = depInst->getOperand(0);  // depInst is store
-            }
-          }
-          newInst->insertBefore(depInst);
-          vmap[inst] = newInst;
-          RemapInstruction(newInst, vmap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
-          if (inst == loadChain.back()) {
-            StoreInst *newSt = new StoreInst(newInst, var, depInst);
-            // errs() << "\nAfter change:\nStore block: " << *newSt->getParent() << '\n';
-          }
-        }        
-      }
-
-      // TODO: fix bug here
-      // for (auto const &depInst : hoistDeps[loadInst])
-      //   depInst->eraseFromParent();
-    }
-
-    /* *******Implementation Ends Here******* */
-
-    return Changed;
-  }
-
-  void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.addRequired<BranchProbabilityInfoWrapperPass>();
-    AU.addRequired<BlockFrequencyInfoWrapperPass>();
-    AU.addRequired<LoopInfoWrapperPass>();
-  }
-
-private:
-  /// Little predicate that returns true if the specified basic block is in
-  /// a subloop of the current one, not the current one itself.
-  bool inSubLoop(BasicBlock *BB, Loop *CurLoop, LoopInfo *LI) {
-    assert(CurLoop->contains(BB) && "Only valid if BB is IN the loop");
-    return LI->getLoopFor(BB) != CurLoop;
-  }
-};
-} // end of namespace Performance
-
-char Performance::FPLICMPass::ID = 0;
-static RegisterPass<Performance::FPLICMPass>
-    Y("fplicm-performance",
-      "Frequent Loop Invariant Code Motion for performance test", false, false);
