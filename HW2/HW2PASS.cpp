@@ -78,9 +78,9 @@ namespace BaseTrace {
 
     Trace GrowTrace(BasicBlock* seedBB, DominatorTree &DT, PostDominatorTree &PDT, Function &F) {
       std::vector<BasicBlock*> trace;
-      trace.push_back(seedBB);
       BasicBlock *currBB = seedBB;
       while (1) {
+        trace.push_back(currBB);
         visited.insert(currBB);
         BasicBlock *likelyBB = predict(currBB, F, PDT);
         if (!likelyBB || visited.find(likelyBB) != visited.end()) {break;}
@@ -102,24 +102,30 @@ namespace BaseTrace {
 
       // create block list based on loop
       for (Loop* L : allLoops) {
-        errs() << "\nLoop\n";
+        // errs() << "\nLoop\n";
         for (BasicBlock* BB : L->getBlocksVector()) {
-          if (visited.find(BB) != visited.end() && !inSubLoop(BB, L, &LI)) {
+          if (visited.find(BB) == visited.end() && !inSubLoop(BB, L, &LI)) {
             traces.push_back(GrowTrace(BB, DT, PDT, F));
           }
-          errs() << BB->getName() << '\n';
+          // errs() << BB->getName() << '\n';
         }
       }
 
-      errs() << "\nFunc\n";
+      // errs() << "\nFunc\n";
       for (BasicBlock &BB : F) {
-        if (visited.find(&BB) != visited.end()) {
+        if (visited.find(&BB) == visited.end()) {
           traces.push_back(GrowTrace(&BB, DT, PDT, F));
         }
-        errs() << BB.getName() << '\n';
+        // errs() << BB.getName() << '\n';
       }
 
       // evaluation
+      for (Trace trace : traces) {
+        errs() << "\nTraces:\n";
+        for (BasicBlock *traceBB : trace) {
+          errs() << traceBB->getName() << '\n';
+        }
+      }
       
       return false;
     }
