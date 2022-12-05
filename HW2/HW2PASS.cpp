@@ -160,42 +160,43 @@ namespace BaseTrace {
 char BaseTrace::BaseTracePass::ID = 0;
 static RegisterPass<BaseTrace::BaseTracePass>
     B("base",
-      "testing inheritence", false, false);
+      "base trace formation", false, false);
 
 namespace StaticTrace {
   struct StaticTracePass : public BaseTrace::BaseTracePass {
     static char ID;
     StaticTracePass() : BaseTracePass(ID) {};
+    StaticTracePass(char id): BaseTracePass(id) {};
 
     bool containHazard(BasicBlock* bb) {
       errs()<<"Processing containHazard for block "<<bb->getName()<<'\n';
       for (BasicBlock::iterator i = bb->begin(), e = bb->end(); i != e; ++i) {
           string op = i->getOpcodeName();
           if (op=="call") // subroutine call
-              return true;
+            return true;
           if (i->isAtomic()) // sync instr
-              return true;
+            return true;
           if (op=="store") { // ambiguous store
-              Value *oper = i->getOperand(1); // get the store destination
-              if (Instruction *stdestInstr = dyn_cast<Instruction>(oper)) {
-                  string stdestOp = stdestInstr->getOpcodeName();
-		  errs()<<"store destination instr: "<< stdestOp<<'\n';
-		  if (stdestOp=="alloca") {
-                      errs()<<"not hazard"<<'\n';
-		      continue; // known at compile time
-		  }
-		  if (GetElementPtrInst *GEPInstr = dyn_cast<GetElementPtrInst>(stdestInstr)) {
-                      if (GEPInstr->hasAllConstantIndices()) {
-                          if (Instruction *ptrInstr = dyn_cast<Instruction>(GEPInstr->getPointerOperand())) {
-                              string ptrOp = ptrInstr->getOpcodeName();
-			      if (ptrOp=="alloca") {
-                                  errs()<<"not hazard"<<'\n';
-				  continue; // known at compile time
-			      }
-			  }
-		      }
-		  }
-		  return true; // otherwise unknown at compile time
+            Value *oper = i->getOperand(1); // get the store destination
+            if (Instruction *stdestInstr = dyn_cast<Instruction>(oper)) {
+                string stdestOp = stdestInstr->getOpcodeName();
+                errs()<<"store destination instr: "<< stdestOp<<'\n';
+                if (stdestOp=="alloca") {
+                    errs()<<"not hazard"<<'\n';
+                    continue; // known at compile time
+                }
+                if (GetElementPtrInst *GEPInstr = dyn_cast<GetElementPtrInst>(stdestInstr)) {
+                    if (GEPInstr->hasAllConstantIndices()) {
+                        if (Instruction *ptrInstr = dyn_cast<Instruction>(GEPInstr->getPointerOperand())) {
+                            string ptrOp = ptrInstr->getOpcodeName();
+                            if (ptrOp=="alloca") {
+                                errs()<<"not hazard"<<'\n';
+                                continue; // known at compile time
+                            }
+                        }
+                    }
+                }
+                return true; // otherwise unknown at compile time
               }
           }
           if (op=="ret") // subroutine return
@@ -478,4 +479,66 @@ namespace StaticTrace {
 char StaticTrace::StaticTracePass::ID = 0;
 static RegisterPass<StaticTrace::StaticTracePass>
     C("static",
+      "hazard avoidance + path selection", false, false);
+
+namespace ProfileTrace {
+    struct ProfileTracePass : public BaseTrace::BaseTracePass {
+        static char ID;
+        ProfileTracePass() : BaseTracePass(ID) {};
+
+        virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT) override {
+            /*
+            TODO: pick the frequent path as the likely block. 
+            Like HW2, if neither probability reaches the threshold, return nullptr.
+            */
+           return nullptr;
+        }
+
+        private:
+    };
+}
+char ProfileTrace::ProfileTracePass::ID = 0;
+static RegisterPass<ProfileTrace::ProfileTracePass>
+    P("profile",
+      "use profile info", false, false);
+
+
+namespace HazardProfileTrace {
+    struct HazardProfileTracePass : public StaticTrace::StaticTracePass {
+        static char ID;
+        HazardProfileTracePass() : StaticTracePass(ID) {};
+
+        virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT) override {
+            if (containHazard(BB)) return nullptr;
+            Instruction *T = BB->getTerminator();
+            if (BranchInst *brInst = dyn_cast<BranchInst>(T)) {
+                if (brInst->isConditional()) { // conditional branch
+                    Instruction *Icond = dyn_cast<Instruction>(brInst->getCondition());
+                    pair<Value*, Value*> brOps = make_pair(Icond->getOperand(0), Icond->getOperand(1));
+                    bool hasHazard[2] = {0, 0};
+                    for (unsigned bridx = 0; bridx < 2; bridx++) {
+                        BasicBlock *Succ = brInst->getSuccessor(bridx);
+                        if (containHazard(Succ)) hasHazard[bridx] = 1;
+                        /*for (Function::iterator bb = F.begin(), e = F.end(); bb != e; ++bb) {
+                            if (PDT.dominates(&bb->front(), &Succ->front()))
+                                if (containHazard(&(*bb))) hasHazard[bridx] = 1;
+                        }*/
+                    }
+                    if (hasHazard[0] & !hasHazard[1]) return brInst->getSuccessor(1);
+                    if (!hasHazard[0] & hasHazard[1]) return brInst->getSuccessor(0);
+                    if (hasHazard[0] & hasHazard[1]) return nullptr;
+                    
+                    /*
+                    TODO: pick the most frequent path if both path contains no hazards.
+                    Like HW2, if neither probability reaches the threshold, return nullptr.
+                    */
+                }
+            }
+            return T->getSuccessor(0); // if no applicable heuristic, return the first succ
+        }
+    };
+}
+char HazardProfileTrace::HazardProfileTracePass::ID = 0;
+static RegisterPass<HazardProfileTrace::HazardProfileTracePass>
+    HP("hazardprofile",
       "testing inheritence", false, false);
