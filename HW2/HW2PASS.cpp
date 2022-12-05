@@ -153,8 +153,9 @@ namespace BaseTrace {
       AU.addRequired<DominatorTreeWrapperPass>();
       AU.addRequired<PostDominatorTreeWrapperPass>();
     }
-    private:
+    protected:
     uint32_t thresProb = uint32_t((1u << 31) * 0.6);
+    private:
     std::set<BasicBlock*> visited;
     std::vector<Trace> traces;
     /// Little predicate that returns true if the specified basic block is in
