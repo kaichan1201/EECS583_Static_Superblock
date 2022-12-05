@@ -80,13 +80,13 @@ namespace BaseTrace {
     BaseTracePass() : FunctionPass(ID) {};
     BaseTracePass(char id): FunctionPass(id) {};
 
-    Trace GrowTrace(BasicBlock* seedBB, DominatorTree &DT, PostDominatorTree &PDT, Function &F) {
+    Trace GrowTrace(BasicBlock* seedBB, DominatorTree &DT, PostDominatorTree &PDT, Function &F, BranchProbabilityInfo &BPI) {
       std::vector<BasicBlock*> trace;
       BasicBlock *currBB = seedBB;
       while (1) {
         trace.push_back(currBB);
         visited.insert(currBB);
-        BasicBlock *likelyBB = predict(currBB, F, PDT);
+        BasicBlock *likelyBB = predict(currBB, F, PDT, BPI);
         if (!likelyBB || visited.find(likelyBB) != visited.end()) {break;}
         if (DT.dominates(&likelyBB->front(), &currBB->front())) {break;}
         currBB = likelyBB;
@@ -98,6 +98,8 @@ namespace BaseTrace {
       LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
       DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
       PostDominatorTree &PDT = getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
+      BranchProbabilityInfo &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
+      BlockFrequencyInfo &BFI = getAnalysis<BlockFrequencyInfoWrapperPass>().getBFI();
 
       prepare(F, LI, PDT);
 
@@ -111,7 +113,7 @@ namespace BaseTrace {
         errs() << "\nLoop " << L->getLoopDepth() << '\n';
         for (BasicBlock* BB : L->getBlocksVector()) {
           if (visited.find(BB) == visited.end() && !inSubLoop(BB, L, &LI)) {
-            traces.push_back(GrowTrace(BB, DT, PDT, F));
+            traces.push_back(GrowTrace(BB, DT, PDT, F, BPI));
           }
           // errs() << BB->getName() << '\n';
         }
@@ -120,7 +122,7 @@ namespace BaseTrace {
       // errs() << "\nFunc\n";
       for (BasicBlock &BB : F) {
         if (visited.find(&BB) == visited.end()) {
-          traces.push_back(GrowTrace(&BB, DT, PDT, F));
+          traces.push_back(GrowTrace(&BB, DT, PDT, F, BPI));
         }
         // errs() << BB.getName() << '\n';
       }
@@ -140,7 +142,7 @@ namespace BaseTrace {
 
     }
 
-    virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT) {
+    virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT, BranchProbabilityInfo &BPI) {
       return nullptr;
     }
 
@@ -152,6 +154,7 @@ namespace BaseTrace {
       AU.addRequired<PostDominatorTreeWrapperPass>();
     }
     private:
+    uint32_t thresProb = uint32_t((1u << 31) * 0.6);
     std::set<BasicBlock*> visited;
     std::vector<Trace> traces;
     /// Little predicate that returns true if the specified basic block is in
@@ -212,7 +215,7 @@ namespace StaticTrace {
       }
       errs()<<"Block "<<bb->getName()<<" has no hazard!"<<'\n';
       return false;
-  }
+    }
 
     virtual void prepare(Function &F, LoopInfo &LI, PostDominatorTree &PDT) override {
       for (Function::iterator bb = F.begin(), e = F.end(); bb != e; ++bb) {
@@ -447,7 +450,7 @@ namespace StaticTrace {
       }
     }
 
-    virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT) override {
+    virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT, BranchProbabilityInfo &BPI) override {
       if (containHazard(BB)) return nullptr;
       Instruction *T = BB->getTerminator();
       if (BranchInst *brInst = dyn_cast<BranchInst>(T)) {
@@ -492,12 +495,18 @@ namespace ProfileTrace {
         static char ID;
         ProfileTracePass() : BaseTracePass(ID) {};
 
-        virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT) override {
-            /*
-            TODO: pick the frequent path as the likely block. 
-            Like HW2, if neither probability reaches the threshold, return nullptr.
-            */
-           return nullptr;
+        virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT, BranchProbabilityInfo &BPI) override {
+            BasicBlock *bestSucc = nullptr;
+            uint32_t maxProb = 0;
+            for (BasicBlock *Succ : successors(BB)) {
+                uint32_t prob = BPI.getEdgeProbability(BB, Succ).getNumerator();
+                if (prob > maxProb) {
+                    maxProb = prob;
+                    bestSucc = Succ;
+                }
+            }
+            if (maxProb >= thresProb) return bestSucc;
+            else return nullptr;
         }
 
         private:
@@ -514,7 +523,7 @@ namespace HazardProfileTrace {
         static char ID;
         HazardProfileTracePass() : StaticTracePass(ID) {};
 
-        virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT) override {
+        virtual BasicBlock* predict(BasicBlock *BB, Function &F, PostDominatorTree &PDT, BranchProbabilityInfo &BPI) override {
             if (containHazard(BB)) return nullptr;
             Instruction *T = BB->getTerminator();
             if (BranchInst *brInst = dyn_cast<BranchInst>(T)) {
@@ -533,14 +542,20 @@ namespace HazardProfileTrace {
                     if (hasHazard[0] & !hasHazard[1]) return brInst->getSuccessor(1);
                     if (!hasHazard[0] & hasHazard[1]) return brInst->getSuccessor(0);
                     if (hasHazard[0] & hasHazard[1]) return nullptr;
-                    
-                    /*
-                    TODO: pick the most frequent path if both path contains no hazards.
-                    Like HW2, if neither probability reaches the threshold, return nullptr.
-                    */
                 }
             }
-            return T->getSuccessor(0); // if no applicable heuristic, return the first succ
+
+            BasicBlock *bestSucc = nullptr;
+            uint32_t maxProb = 0;
+            for (BasicBlock *Succ : successors(BB)) {
+                uint32_t prob = BPI.getEdgeProbability(BB, Succ).getNumerator();
+                if (prob > maxProb) {
+                    maxProb = prob;
+                    bestSucc = Succ;
+                }
+            }
+            if (maxProb >= thresProb) return bestSucc;
+            else return nullptr;
         }
     };
 }
