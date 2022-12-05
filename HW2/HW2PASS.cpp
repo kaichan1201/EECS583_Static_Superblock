@@ -168,22 +168,42 @@ namespace StaticTrace {
     StaticTracePass() : BaseTracePass(ID) {};
 
     bool containHazard(BasicBlock* bb) {
+      errs()<<"Processing containHazard for block "<<bb->getName()<<'\n';
       for (BasicBlock::iterator i = bb->begin(), e = bb->end(); i != e; ++i) {
-          std::string op = i->getOpcodeName();
+          string op = i->getOpcodeName();
           if (op=="call") // subroutine call
               return true;
           if (i->isAtomic()) // sync instr
               return true;
           if (op=="store") { // ambiguous store
               Value *oper = i->getOperand(1); // get the store destination
-              if (auto *constant = dyn_cast<Constant>(oper)) continue;
-              else return true;
+              if (Instruction *stdestInstr = dyn_cast<Instruction>(oper)) {
+                  string stdestOp = stdestInstr->getOpcodeName();
+		  errs()<<"store destination instr: "<< stdestOp<<'\n';
+		  if (stdestOp=="alloca") {
+                      errs()<<"not hazard"<<'\n';
+		      continue; // known at compile time
+		  }
+		  if (GetElementPtrInst *GEPInstr = dyn_cast<GetElementPtrInst>(stdestInstr)) {
+                      if (GEPInstr->hasAllConstantIndices()) {
+                          if (Instruction *ptrInstr = dyn_cast<Instruction>(GEPInstr->getPointerOperand())) {
+                              string ptrOp = ptrInstr->getOpcodeName();
+			      if (ptrOp=="alloca") {
+                                  errs()<<"not hazard"<<'\n';
+				  continue; // known at compile time
+			      }
+			  }
+		      }
+		  }
+		  return true; // otherwise unknown at compile time
+              }
           }
           if (op=="ret") // subroutine return
               return true;
           if (op=="indirectbr") // indirect jump
               return true;
       }
+      errs()<<"Block "<<bb->getName()<<" has no hazard!"<<'\n';
       return false;
   }
 
@@ -431,10 +451,10 @@ namespace StaticTrace {
               for (unsigned bridx = 0; bridx < 2; bridx++) {
                   BasicBlock *Succ = brInst->getSuccessor(bridx);
                   if (containHazard(Succ)) hasHazard[bridx] = 1;
-                  for (Function::iterator bb = F.begin(), e = F.end(); bb != e; ++bb) {
+                  /*for (Function::iterator bb = F.begin(), e = F.end(); bb != e; ++bb) {
                       if (PDT.dominates(&bb->front(), &Succ->front()))
                           if (containHazard(&(*bb))) hasHazard[bridx] = 1;
-                  }
+                  }*/
               }
               if (hasHazard[0] & !hasHazard[1]) return brInst->getSuccessor(1);
               if (!hasHazard[0] & hasHazard[1]) return brInst->getSuccessor(0);
