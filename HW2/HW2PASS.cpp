@@ -74,6 +74,46 @@ bool CompareLoopDepth(Loop* L1, Loop* L2) {
     return L1->getLoopDepth() > L2->getLoopDepth();
 }
 
+    bool containHazard(BasicBlock* bb) {
+    //   errs()<<"Processing containHazard for block "<<bb->getName()<<'\n';
+      for (BasicBlock::iterator i = bb->begin(), e = bb->end(); i != e; ++i) {
+          string op = i->getOpcodeName();
+          if (op=="call") // subroutine call
+            return true;
+          if (i->isAtomic()) // sync instr
+            return true;
+          if (op=="store") { // ambiguous store
+            Value *oper = i->getOperand(1); // get the store destination
+            if (Instruction *stdestInstr = dyn_cast<Instruction>(oper)) {
+                string stdestOp = stdestInstr->getOpcodeName();
+                // errs()<<"store destination instr: "<< stdestOp<<'\n';
+                if (stdestOp=="alloca") {
+                    // errs()<<"not hazard"<<'\n';
+                    continue; // known at compile time
+                }
+                if (GetElementPtrInst *GEPInstr = dyn_cast<GetElementPtrInst>(stdestInstr)) {
+                    if (GEPInstr->hasAllConstantIndices()) {
+                        if (Instruction *ptrInstr = dyn_cast<Instruction>(GEPInstr->getPointerOperand())) {
+                            string ptrOp = ptrInstr->getOpcodeName();
+                            if (ptrOp=="alloca") {
+                                // errs()<<"not hazard"<<'\n';
+                                continue; // known at compile time
+                            }
+                        }
+                    }
+                }
+                return true; // otherwise unknown at compile time
+              }
+          }
+          if (op=="ret") // subroutine return
+              return true;
+          if (op=="indirectbr") // indirect jump
+              return true;
+      }
+    //   errs()<<"Block "<<bb->getName()<<" has no hazard!"<<'\n';
+      return false;
+    }
+
 namespace BaseTrace {
   struct BaseTracePass : public FunctionPass {
     static char ID;
@@ -128,12 +168,57 @@ namespace BaseTrace {
       }
 
       // evaluation
-      for (Trace trace : traces) {
-        errs() << "\nTraces:\n";
-        for (BasicBlock *traceBB : trace) {
-          errs() << traceBB->getName() << '\n';
+        double total_in = 0;
+        double total_out = 0;
+        int total_hazard = 0;
+        for (Trace trace : traces) {
+            BasicBlock *head = *(trace.begin());
+            int totalHazard = 0;
+            uint64_t init_in_count = BFI.getBlockProfileCount(head).getValue();
+            uint64_t in_count = init_in_count;
+            double out_count = in_count;
+            for (Trace::iterator TI = trace.begin(); TI != trace.end(); ++TI) {
+                BasicBlock *BB = *TI;
+                //errs() << "Starting at " << BB->getName() << '\n';
+                if (containHazard(BB)) {
+                    totalHazard++;
+                }
+                for (BasicBlock *succ : successors(BB)) {
+                    if (trace.contains(succ)) {
+                        BranchProbability succ_bpi = BPI.getEdgeProbability(BB, succ);
+                        double bp_double = succ_bpi.getNumerator() / double(succ_bpi.getDenominator());
+                        //uint64_t succ_count = BFI.getBlockProfileCount(succ).getValue();
+                        //errs() << "succ: " << succ_count << succ->getName() << '\n';
+                        
+                        out_count = in_count * bp_double;
+                        
+                        //errs() << "new in_count: " << in_count << '\n';
+                        //errs() << "new out_count: " << out_count << '\n';
+                        in_count = out_count;
+                    }
+                }
+            }
+            total_in += init_in_count;
+            total_out += out_count;
+            total_hazard += totalHazard;
+            errs() << "\nTrace: size " << trace.size() << '\n';
+            errs() << "Num of hazards: " << totalHazard << '\n';
+            errs() << "in_count: " << init_in_count << '\n';
+            errs() << "out_count: " << format("%.3f" ,out_count) << '\n';
+            errs() << "fall thru: " << format("%.3f" ,out_count / init_in_count) << "\n\n";
         }
-      }
+        //errs() << "total in count: " << init_in_count << '\n';
+        errs() << "total hazard: " << total_hazard << '\n';
+        errs() << "average fall thru: " << format("%.3f" , total_out / total_in) << "\n\n";
+
+
+
+      //for (Trace trace : traces) {
+      //  errs() << "\nTraces:\n";
+      //  for (BasicBlock *traceBB : trace) {
+      //    errs() << traceBB->getName() << '\n';
+      //  }
+      //}
       
       return false;
     }
@@ -177,46 +262,6 @@ namespace StaticTrace {
     static char ID;
     StaticTracePass() : BaseTracePass(ID) {};
     StaticTracePass(char id): BaseTracePass(id) {};
-
-    bool containHazard(BasicBlock* bb) {
-      errs()<<"Processing containHazard for block "<<bb->getName()<<'\n';
-      for (BasicBlock::iterator i = bb->begin(), e = bb->end(); i != e; ++i) {
-          string op = i->getOpcodeName();
-          if (op=="call") // subroutine call
-            return true;
-          if (i->isAtomic()) // sync instr
-            return true;
-          if (op=="store") { // ambiguous store
-            Value *oper = i->getOperand(1); // get the store destination
-            if (Instruction *stdestInstr = dyn_cast<Instruction>(oper)) {
-                string stdestOp = stdestInstr->getOpcodeName();
-                errs()<<"store destination instr: "<< stdestOp<<'\n';
-                if (stdestOp=="alloca") {
-                    errs()<<"not hazard"<<'\n';
-                    continue; // known at compile time
-                }
-                if (GetElementPtrInst *GEPInstr = dyn_cast<GetElementPtrInst>(stdestInstr)) {
-                    if (GEPInstr->hasAllConstantIndices()) {
-                        if (Instruction *ptrInstr = dyn_cast<Instruction>(GEPInstr->getPointerOperand())) {
-                            string ptrOp = ptrInstr->getOpcodeName();
-                            if (ptrOp=="alloca") {
-                                errs()<<"not hazard"<<'\n';
-                                continue; // known at compile time
-                            }
-                        }
-                    }
-                }
-                return true; // otherwise unknown at compile time
-              }
-          }
-          if (op=="ret") // subroutine return
-              return true;
-          if (op=="indirectbr") // indirect jump
-              return true;
-      }
-      errs()<<"Block "<<bb->getName()<<" has no hazard!"<<'\n';
-      return false;
-    }
 
     virtual void prepare(Function &F, LoopInfo &LI, PostDominatorTree &PDT) override {
       for (Function::iterator bb = F.begin(), e = F.end(); bb != e; ++bb) {
