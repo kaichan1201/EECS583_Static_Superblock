@@ -527,7 +527,7 @@ namespace StaticTrace {
       for (BasicBlock *Succ : successors(BB)) {
           if (!containHazard(Succ)) return Succ;
       } // if no applicable heuristic, return the first hazard-free succ
-      return nullptr; // if no, return nullptr
+      return nullptr; // if no any, return nullptr
     }
 
     private:
@@ -604,7 +604,7 @@ namespace HazardProfileTrace {
                     bestSucc = Succ;
                 }
             }
-            if (maxProb >= thresProb) return bestSucc;
+            if ((maxProb >= thresProb) & !containHazard(bestSucc)) return bestSucc;
             else return nullptr;
         }
     };
