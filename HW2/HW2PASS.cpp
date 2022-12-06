@@ -524,7 +524,10 @@ namespace StaticTrace {
               }
           }
       }
-      return T->getSuccessor(0); // if no applicable heuristic, return the first succ
+      for (BasicBlock *Succ : successors(BB)) {
+          if (!containHazard(Succ)) return Succ;
+      } // if no applicable heuristic, return the first hazard-free succ
+      return nullptr; // if no, return nullptr
     }
 
     private:
