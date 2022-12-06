@@ -172,6 +172,7 @@ namespace BaseTrace {
         double total_out = 0;
         int total_hazard = 0;
         for (Trace trace : traces) {
+            if (trace.size() <= 1) continue;
             BasicBlock *head = *(trace.begin());
             int totalHazard = 0;
             uint64_t init_in_count = BFI.getBlockProfileCount(head).getValue();
